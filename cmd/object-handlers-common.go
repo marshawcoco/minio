@@ -374,6 +374,9 @@ func setPutObjHeaders(w http.ResponseWriter, objInfo ObjectInfo, del bool, h htt
 			lc.SetPredictionHeaders(w, objInfo.ToLifecycleOpts())
 		}
 	}
+	if !del {
+		setEffectiveECBlockSizeHeader(w.Header(), objInfo.EffectiveECBlockSize())
+	}
 	cs, _ := objInfo.decryptChecksums(0, h)
 	hash.AddChecksumHeader(w, cs)
 }

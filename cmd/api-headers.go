@@ -254,6 +254,8 @@ func setObjectHeaders(ctx context.Context, w http.ResponseWriter, objInfo Object
 		w.Header()[xhttp.MinIOCompressed] = []string{v}
 	}
 
+	setEffectiveECBlockSizeHeader(w.Header(), objInfo.EffectiveECBlockSize())
+
 	return nil
 }
 

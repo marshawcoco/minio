@@ -194,11 +194,19 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 		metadata[ReservedMetadataPrefix+"compression"] = compressionAlgorithmV2
 	}
 
+	eligibleWrite := !isCompressible(r.Header, object) && !crypto.Requested(r.Header)
+	layoutRes, err := resolveECBlockLayoutFromMetadata(bucket, object, metadata, eligibleWrite)
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+
 	opts, err := putOptsFromReq(ctx, r, bucket, object, metadata)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
+	opts.ECBlockSize = layoutRes.EffectiveBlockSize
 
 	if r.Header.Get(xhttp.IfMatch) != "" {
 		opts.HasIfMatch = true
@@ -242,6 +250,8 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 			w.Header().Set(xhttp.AmzChecksumType, res.ChecksumType)
 		}
 	}
+	layoutRes.EffectiveBlockSize = res.EffectiveECBlockSize()
+	setECLayoutHintHeaders(w.Header(), layoutRes)
 	encodedSuccessResponse := encodeResponse(response)
 
 	// Write success response.

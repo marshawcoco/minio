@@ -459,6 +459,19 @@ func (er erasureObjects) newMultipartUpload(ctx context.Context, bucket string, 
 	if opts.Versioned && fi.VersionID == "" {
 		fi.VersionID = mustGetUUID()
 	}
+	if opts.ECBlockSize > 0 {
+		if IsCandidateECBlockSize(opts.ECBlockSize) {
+			fi.Erasure.BlockSize = opts.ECBlockSize
+		}
+	} else {
+		_, isEnc := crypto.IsEncrypted(userDefined)
+		_, isComp := userDefined[ReservedMetadataPrefix+"compression"]
+		layoutRes, lerr := resolveECBlockLayoutFromMetadata(bucket, object, userDefined, !isComp && !isEnc)
+		if lerr != nil {
+			return nil, lerr
+		}
+		fi.Erasure.BlockSize = layoutRes.EffectiveBlockSize
+	}
 	fi.DataDir = mustGetUUID()
 
 	if ckSum := userDefined[ReplicationSsecChecksumHeader]; ckSum != "" {
@@ -513,9 +526,10 @@ func (er erasureObjects) newMultipartUpload(ctx context.Context, bucket string, 
 	}
 
 	return &NewMultipartUploadResult{
-		UploadID:     uploadID,
-		ChecksumAlgo: userDefined[hash.MinIOMultipartChecksum],
-		ChecksumType: userDefined[hash.MinIOMultipartChecksumType],
+		UploadID:         uploadID,
+		ChecksumAlgo:     userDefined[hash.MinIOMultipartChecksum],
+		ChecksumType:     userDefined[hash.MinIOMultipartChecksumType],
+		ErasureBlockSize: fi.Erasure.BlockSize,
 	}, nil
 }
 
@@ -634,12 +648,9 @@ func (er erasureObjects) PutObjectPart(ctx context.Context, bucket, object, uplo
 	case size == 0:
 		buffer = make([]byte, 1) // Allocate at least a byte to reach EOF
 	case size >= fi.Erasure.BlockSize || size == -1:
-		if int64(globalBytePoolCap.Load().Width()) < fi.Erasure.BlockSize {
-			buffer = make([]byte, fi.Erasure.BlockSize, 2*fi.Erasure.BlockSize)
-		} else {
-			buffer = globalBytePoolCap.Load().Get()
-			defer globalBytePoolCap.Load().Put(buffer)
-		}
+		var releaseBuf func()
+		buffer, releaseBuf = acquireECBlockBuffer(fi.Erasure.BlockSize)
+		defer releaseBuf()
 	case size < fi.Erasure.BlockSize:
 		// No need to allocate fully fi.Erasure.BlockSize buffer if the incoming data is smaller.
 		buffer = make([]byte, size, 2*size+int64(fi.Erasure.ParityBlocks+fi.Erasure.DataBlocks-1))
@@ -660,11 +671,10 @@ func (er erasureObjects) PutObjectPart(ctx context.Context, bucket, object, uplo
 	if data.Size() > bigFileThreshold {
 		// Add input readahead.
 		// We use 2 buffers, so we always have a full buffer of input.
-		pool := globalBytePoolCap.Load()
-		bufA := pool.Get()
-		bufB := pool.Get()
-		defer pool.Put(bufA)
-		defer pool.Put(bufB)
+		bufA, releaseA := acquireECBlockBuffer(fi.Erasure.BlockSize)
+		bufB, releaseB := acquireECBlockBuffer(fi.Erasure.BlockSize)
+		defer releaseA()
+		defer releaseB()
 		ra, err := readahead.NewReaderBuffer(data, [][]byte{bufA[:fi.Erasure.BlockSize], bufB[:fi.Erasure.BlockSize]})
 		if err == nil {
 			toEncode = ra

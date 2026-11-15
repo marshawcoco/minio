@@ -139,6 +139,7 @@ type ObjectOptions struct {
 
 	FastGetObjInfo bool // Only for S3 Head/Get Object calls for now
 	NoAuditLog     bool // Only set for decom, rebalance, to avoid double audits.
+	ECBlockSize    int64
 }
 
 // WalkOptions provides filtering, marker and other Walk() specific options.

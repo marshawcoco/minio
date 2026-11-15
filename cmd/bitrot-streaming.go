@@ -144,18 +144,38 @@ type streamingBitrotReader struct {
 	h          hash.Hash
 	shardSize  int64
 	hashBytes  []byte
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
-func (b *streamingBitrotReader) Close() error {
+func (b *streamingBitrotReader) Cancel() {
+	if b.cancel != nil {
+		b.cancel()
+	}
+}
+
+func (b *streamingBitrotReader) closeStream(drain bool) error {
 	if b.rc == nil {
 		return nil
 	}
-	if closer, ok := b.rc.(io.Closer); ok {
-		// drain the body for connection reuse at network layer.
-		xhttp.DrainBody(io.NopCloser(b.rc))
+	rc := b.rc
+	b.rc = nil
+	if closer, ok := rc.(io.Closer); ok {
+		if drain && (b.ctx == nil || b.ctx.Err() == nil) {
+			// drain the body for connection reuse at network layer.
+			xhttp.DrainBody(io.NopCloser(rc))
+		}
 		return closer.Close()
 	}
 	return nil
+}
+
+func (b *streamingBitrotReader) Close() error {
+	err := b.closeStream(true)
+	if b.cancel != nil {
+		b.cancel()
+	}
+	return err
 }
 
 func (b *streamingBitrotReader) ReadAt(buf []byte, offset int64) (int, error) {
@@ -165,12 +185,19 @@ func (b *streamingBitrotReader) ReadAt(buf []byte, offset int64) (int, error) {
 		// Can never happen unless there are programmer bugs
 		return 0, errUnexpected
 	}
+	if b.rc != nil && offset != b.currOffset {
+		_ = b.closeStream(true)
+	}
 	if b.rc == nil {
-		// For the first ReadAt() call we need to open the stream for reading.
+		// Open the stream at the requested shard-aligned offset.
 		b.currOffset = offset
 		streamOffset := (offset/b.shardSize)*int64(b.h.Size()) + offset
+		readCtx := b.ctx
+		if readCtx == nil {
+			readCtx = context.Background()
+		}
 		if len(b.data) == 0 && b.tillOffset != streamOffset {
-			b.rc, err = b.disk.ReadFileStream(context.TODO(), b.volume, b.filePath, streamOffset, b.tillOffset-streamOffset)
+			b.rc, err = b.disk.ReadFileStream(readCtx, b.volume, b.filePath, streamOffset, b.tillOffset-streamOffset)
 		} else {
 			b.rc = io.NewSectionReader(bytes.NewReader(b.data), streamOffset, b.tillOffset-streamOffset)
 		}
@@ -178,21 +205,20 @@ func (b *streamingBitrotReader) ReadAt(buf []byte, offset int64) (int, error) {
 			return 0, err
 		}
 	}
-	if offset != b.currOffset {
-		// Can never happen unless there are programmer bugs
-		return 0, errUnexpected
-	}
 	b.h.Reset()
 	_, err = io.ReadFull(b.rc, b.hashBytes)
 	if err != nil {
+		_ = b.closeStream(false)
 		return 0, err
 	}
 	_, err = io.ReadFull(b.rc, buf)
 	if err != nil {
+		_ = b.closeStream(false)
 		return 0, err
 	}
 	b.h.Write(buf)
 	if !bytes.Equal(b.h.Sum(nil), b.hashBytes) {
+		_ = b.closeStream(false)
 		return 0, errFileCorrupt
 	}
 	b.currOffset += int64(len(buf))
@@ -202,6 +228,7 @@ func (b *streamingBitrotReader) ReadAt(buf []byte, offset int64) (int, error) {
 // Returns streaming bitrot reader implementation.
 func newStreamingBitrotReader(disk StorageAPI, data []byte, volume, filePath string, tillOffset int64, algo BitrotAlgorithm, shardSize int64) *streamingBitrotReader {
 	h := algo.New()
+	ctx, cancel := context.WithCancel(context.Background())
 	return &streamingBitrotReader{
 		disk:       disk,
 		data:       data,
@@ -211,5 +238,7 @@ func newStreamingBitrotReader(disk StorageAPI, data []byte, volume, filePath str
 		h:          h,
 		shardSize:  shardSize,
 		hashBytes:  make([]byte, h.Size()),
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 }

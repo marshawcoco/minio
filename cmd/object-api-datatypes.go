@@ -219,8 +219,15 @@ type ObjectInfo struct {
 	// Inlined
 	Inlined bool
 
-	DataBlocks   int
-	ParityBlocks int
+	DataBlocks       int
+	ParityBlocks     int
+	ErasureBlockSize int64 `json:"-" msg:"-"`
+}
+
+// EffectiveECBlockSize returns the object's effective erasure coding block size,
+// defaulting to DefaultECBlockSize (1 MiB) when unset.
+func (o ObjectInfo) EffectiveECBlockSize() int64 {
+	return effectiveECBlockSizeOrDefault(o.ErasureBlockSize)
 }
 
 // ExpiresStr returns a stringified version of Expires header in http.TimeFormat
@@ -289,6 +296,9 @@ func (o *ObjectInfo) Clone() (cinfo ObjectInfo) {
 		SuccessorModTime:           o.SuccessorModTime,
 		ReplicationStatusInternal:  o.ReplicationStatusInternal,
 		VersionPurgeStatusInternal: o.VersionPurgeStatusInternal,
+		DataBlocks:                 o.DataBlocks,
+		ParityBlocks:               o.ParityBlocks,
+		ErasureBlockSize:           o.ErasureBlockSize,
 	}
 	cinfo.UserDefined = make(map[string]string, len(o.UserDefined))
 	maps.Copy(cinfo.UserDefined, o.UserDefined)
@@ -634,9 +644,15 @@ type CompleteMultipartUpload struct {
 
 // NewMultipartUploadResult contains information about a newly created multipart upload.
 type NewMultipartUploadResult struct {
-	UploadID     string
-	ChecksumAlgo string
-	ChecksumType string
+	UploadID         string
+	ChecksumAlgo     string
+	ChecksumType     string
+	ErasureBlockSize int64 `json:"-" msg:"-"`
+}
+
+// EffectiveECBlockSize returns the multipart upload's effective erasure coding block size.
+func (r NewMultipartUploadResult) EffectiveECBlockSize() int64 {
+	return effectiveECBlockSizeOrDefault(r.ErasureBlockSize)
 }
 
 type getObjectAttributesResponse struct {

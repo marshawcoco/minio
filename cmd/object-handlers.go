@@ -1947,12 +1947,20 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 	var reader io.Reader
 	reader = rd
 
+	eligibleWrite := !(isCompressible(r.Header, object) && size > minCompressibleSize) && !crypto.Requested(r.Header)
+	layoutRes, err := resolveECBlockLayoutFromMetadata(bucket, object, metadata, eligibleWrite)
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+
 	var opts ObjectOptions
 	opts, err = putOptsFromReq(ctx, r, bucket, object, metadata)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
+	opts.ECBlockSize = layoutRes.EffectiveBlockSize
 
 	actualSize := size
 	var idxCb func() []byte
@@ -2152,6 +2160,8 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 	}
 
 	setPutObjHeaders(w, objInfo, false, r.Header)
+	layoutRes.EffectiveBlockSize = objInfo.EffectiveECBlockSize()
+	setECLayoutHintHeaders(w.Header(), layoutRes)
 
 	// Notify object created event.
 	evt := eventArgs{

@@ -24,9 +24,14 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	xioutil "github.com/minio/minio/internal/ioutil"
 )
+
+// ecDirectReadHedgeDelay bounds how long a spanned-shard direct read waits on a slow drive
+// before abandoning the stalled reader and falling back to full Reed-Solomon reconstruction.
+var ecDirectReadHedgeDelay = 100 * time.Millisecond
 
 // Reads in parallel from readers.
 type parallelReader struct {
@@ -234,6 +239,139 @@ func (p *parallelReader) Read(dst [][]byte) ([][]byte, error) {
 	return nil, fmt.Errorf("%w (offline-disks=%d/%d)", errErasureReadQuorum, disksNotFound, len(p.readers))
 }
 
+func (p *parallelReader) markReaderFailed(origIdx int) {
+	if origIdx >= 0 && origIdx < len(p.orgReaders) {
+		p.orgReaders[origIdx] = nil
+	}
+	for i, bIdx := range p.readerToBuf {
+		if bIdx == origIdx {
+			p.readers[i] = nil
+		}
+	}
+}
+
+func canDirectReadSpan(readers []io.ReaderAt, startShard, endShard int) bool {
+	if startShard < 0 || endShard < startShard || endShard >= len(readers) {
+		return false
+	}
+	for j := startShard; j <= endShard; j++ {
+		if readers[j] == nil {
+			return false
+		}
+		if _, isWhole := readers[j].(*wholeBitrotReader); isWhole {
+			return false
+		}
+	}
+	return true
+}
+
+func recordHealError(derr *error, err error) {
+	if *derr == nil && (errors.Is(err, errFileNotFound) || errors.Is(err, errFileCorrupt)) {
+		*derr = err
+	}
+}
+
+func failDirectReader(readers []io.ReaderAt, reader *parallelReader, shardIdx int, closeNow bool) {
+	rr := readers[shardIdx]
+	readers[shardIdx] = nil
+	if reader != nil {
+		reader.markReaderFailed(shardIdx)
+	}
+	if closeNow && rr != nil {
+		if closer, ok := rr.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}
+}
+
+// tryReadSpannedShardsDirect reads only the data shards [startShard..endShard] overlapped by a sub-stripe
+// range request. Each spanned shard still verifies its per-shard HighwayHash256S bitrot frame via ReadAt.
+// On any missing/corrupt shard or slow-drive hedge timeout, it returns ok=false without writing any bytes
+// so the caller transparently falls back to full parallelReader Reed-Solomon reconstruction.
+func (e Erasure) tryReadSpannedShardsDirect(
+	ctx context.Context,
+	readers []io.ReaderAt,
+	reader *parallelReader,
+	startShard, endShard int,
+	shardOffset, curShardSize int64,
+	derr *error,
+) ([]byte, bool, error) {
+	spannedCount := endShard - startShard + 1
+	directBuf := make([]byte, int64(spannedCount)*curShardSize)
+	states := make([]atomic.Int32, spannedCount) // 0=running, 1=abandoned, 2=done
+	errs := make([]error, spannedCount)
+	doneCh := make(chan int, spannedCount)
+
+	for idx := 0; idx < spannedCount; idx++ {
+		rr := readers[startShard+idx]
+		dst := directBuf[int64(idx)*curShardSize : int64(idx+1)*curShardSize]
+		go func(idx int, rr io.ReaderAt, dst []byte) {
+			n, err := rr.ReadAt(dst, shardOffset)
+			if err == nil && int64(n) != curShardSize {
+				err = errLessData
+			}
+			errs[idx] = err
+			if states[idx].CompareAndSwap(0, 2) {
+				doneCh <- idx
+				return
+			}
+			// Caller timed out or cancelled and transferred exclusive ownership of rr to this goroutine.
+			if closer, ok := rr.(io.Closer); ok {
+				_ = closer.Close()
+			}
+		}(idx, rr, dst)
+	}
+
+	timer := time.NewTimer(ecDirectReadHedgeDelay)
+	defer timer.Stop()
+
+	timedOut := false
+	completed := 0
+	for completed < spannedCount && !timedOut {
+		select {
+		case <-doneCh:
+			completed++
+		case <-timer.C:
+			timedOut = true
+		case <-ctx.Done():
+			timedOut = true
+		}
+	}
+
+	if timedOut {
+		for idx := 0; idx < spannedCount; idx++ {
+			shardIdx := startShard + idx
+			if states[idx].CompareAndSwap(0, 1) {
+				rr := readers[shardIdx]
+				failDirectReader(readers, reader, shardIdx, false)
+				if canceler, ok := rr.(interface{ Cancel() }); ok {
+					canceler.Cancel()
+				}
+			} else if states[idx].Load() == 2 && errs[idx] != nil {
+				recordHealError(derr, errs[idx])
+				failDirectReader(readers, reader, shardIdx, true)
+			}
+		}
+		if ctx.Err() != nil {
+			return nil, false, ctx.Err()
+		}
+		return nil, false, nil
+	}
+
+	allOK := true
+	for idx := 0; idx < spannedCount; idx++ {
+		if errs[idx] != nil {
+			allOK = false
+			recordHealError(derr, errs[idx])
+			failDirectReader(readers, reader, startShard+idx, true)
+		}
+	}
+	if !allOK {
+		return nil, false, nil
+	}
+	return directBuf, true, nil
+}
+
 // Decode reads from readers, reconstructs data if needed and writes the data to the writer.
 // A set of preferred drives can be supplied. In that case they will be used and the data reconstructed.
 func (e Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.ReaderAt, offset, length, totalLength int64, prefer []bool) (written int64, derr error) {
@@ -248,14 +386,28 @@ func (e Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Read
 		return 0, nil
 	}
 
-	reader := newParallelReader(readers, e, offset, totalLength)
-	if len(prefer) == len(readers) {
-		reader.preferReaders(prefer)
+	var reader *parallelReader
+	getParallelReader := func(block int64) *parallelReader {
+		if reader == nil {
+			reader = newParallelReader(readers, e, block*e.blockSize, totalLength)
+			if len(prefer) == len(readers) {
+				reader.preferReaders(prefer)
+			}
+		} else {
+			reader.offset = block * e.ShardSize()
+			reader.shardSize = e.ShardSize()
+		}
+		return reader
 	}
-	defer reader.Done()
+	defer func() {
+		if reader != nil {
+			reader.Done()
+		}
+	}()
 
 	startBlock := offset / e.blockSize
 	endBlock := (offset + length) / e.blockSize
+	directReadAllowed := ecDirectShardReadEnabled()
 
 	var bytesWritten int64
 	var bufs [][]byte
@@ -279,8 +431,43 @@ func (e Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Read
 			break
 		}
 
+		if directReadAllowed && e.dataBlocks > 1 {
+			stripeDataLen := min(e.blockSize, totalLength-block*e.blockSize)
+			curShardSize := ceilFrac(stripeDataLen, int64(e.dataBlocks))
+			if curShardSize > 0 {
+				startShard := int(blockOffset / curShardSize)
+				endShard := int((blockOffset + blockLength - 1) / curShardSize)
+				spannedCount := endShard - startShard + 1
+				if spannedCount < e.dataBlocks && canDirectReadSpan(readers, startShard, endShard) {
+					shardOffset := block * e.ShardSize()
+					directBuf, ok, ctxErr := e.tryReadSpannedShardsDirect(
+						ctx, readers, reader, startShard, endShard, shardOffset, curShardSize, &derr,
+					)
+					if ctxErr != nil {
+						return -1, ctxErr
+					}
+					if ok {
+						if ctx.Err() != nil {
+							return -1, ctx.Err()
+						}
+						sliceStart := blockOffset - int64(startShard)*curShardSize
+						nw, werr := writer.Write(directBuf[sliceStart : sliceStart+blockLength])
+						if werr != nil {
+							return -1, werr
+						}
+						if int64(nw) != blockLength {
+							return -1, io.ErrShortWrite
+						}
+						bytesWritten += int64(nw)
+						continue
+					}
+				}
+			}
+		}
+
 		var err error
-		bufs, err = reader.Read(bufs)
+		pr := getParallelReader(block)
+		bufs, err = pr.Read(bufs)
 		if len(bufs) > 0 {
 			// Set only if there are be enough data for reconstruction.
 			// and only for expected errors, also set once.

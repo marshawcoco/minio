@@ -100,6 +100,7 @@ func (fi FileInfo) ToObjectInfo(bucket, object string, versioned bool) ObjectInf
 		Name:             object,
 		ParityBlocks:     fi.Erasure.ParityBlocks,
 		DataBlocks:       fi.Erasure.DataBlocks,
+		ErasureBlockSize: fi.Erasure.BlockSize,
 		VersionID:        versionID,
 		IsLatest:         fi.IsLatest,
 		DeleteMarker:     fi.Deleted,
@@ -301,6 +302,9 @@ func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.
 		mtimeValid := meta.ModTime.Equal(modTime)
 		if mtimeValid || etagOnly {
 			fmt.Fprintf(h, "%v", meta.XLV1)
+			if meta.Erasure.BlockSize > 0 && meta.Erasure.BlockSize != blockSizeV2 {
+				fmt.Fprintf(h, "bs.%d", meta.Erasure.BlockSize)
+			}
 			for _, part := range meta.Parts {
 				fmt.Fprintf(h, "part.%d", part.Number)
 				fmt.Fprintf(h, "part.%d", part.Size)
