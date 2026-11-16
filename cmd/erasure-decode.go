@@ -289,13 +289,12 @@ func failDirectReader(readers []io.ReaderAt, reader *parallelReader, shardIdx in
 // On any missing/corrupt shard or slow-drive hedge timeout, it returns ok=false without writing any bytes
 // so the caller transparently falls back to full parallelReader Reed-Solomon reconstruction.
 func (e Erasure) tryReadSpannedShardsDirect(
-	ctx context.Context,
 	readers []io.ReaderAt,
 	reader *parallelReader,
 	startShard, endShard int,
 	shardOffset, curShardSize int64,
 	derr *error,
-) ([]byte, bool, error) {
+) ([]byte, bool) {
 	spannedCount := endShard - startShard + 1
 	directBuf := make([]byte, int64(spannedCount)*curShardSize)
 	states := make([]atomic.Int32, spannedCount) // 0=running, 1=abandoned, 2=done
@@ -315,7 +314,7 @@ func (e Erasure) tryReadSpannedShardsDirect(
 				doneCh <- idx
 				return
 			}
-			// Caller timed out or cancelled and transferred exclusive ownership of rr to this goroutine.
+			// Caller timed out and transferred exclusive ownership of rr to this goroutine.
 			if closer, ok := rr.(io.Closer); ok {
 				_ = closer.Close()
 			}
@@ -332,8 +331,6 @@ func (e Erasure) tryReadSpannedShardsDirect(
 		case <-doneCh:
 			completed++
 		case <-timer.C:
-			timedOut = true
-		case <-ctx.Done():
 			timedOut = true
 		}
 	}
@@ -352,10 +349,7 @@ func (e Erasure) tryReadSpannedShardsDirect(
 				failDirectReader(readers, reader, shardIdx, true)
 			}
 		}
-		if ctx.Err() != nil {
-			return nil, false, ctx.Err()
-		}
-		return nil, false, nil
+		return nil, false
 	}
 
 	allOK := true
@@ -367,9 +361,9 @@ func (e Erasure) tryReadSpannedShardsDirect(
 		}
 	}
 	if !allOK {
-		return nil, false, nil
+		return nil, false
 	}
-	return directBuf, true, nil
+	return directBuf, true
 }
 
 // Decode reads from readers, reconstructs data if needed and writes the data to the writer.
@@ -440,16 +434,10 @@ func (e Erasure) Decode(ctx context.Context, writer io.Writer, readers []io.Read
 				spannedCount := endShard - startShard + 1
 				if spannedCount < e.dataBlocks && canDirectReadSpan(readers, startShard, endShard) {
 					shardOffset := block * e.ShardSize()
-					directBuf, ok, ctxErr := e.tryReadSpannedShardsDirect(
-						ctx, readers, reader, startShard, endShard, shardOffset, curShardSize, &derr,
+					directBuf, ok := e.tryReadSpannedShardsDirect(
+						readers, reader, startShard, endShard, shardOffset, curShardSize, &derr,
 					)
-					if ctxErr != nil {
-						return -1, ctxErr
-					}
 					if ok {
-						if ctx.Err() != nil {
-							return -1, ctx.Err()
-						}
 						sliceStart := blockOffset - int64(startShard)*curShardSize
 						nw, werr := writer.Write(directBuf[sliceStart : sliceStart+blockLength])
 						if werr != nil {

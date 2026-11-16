@@ -465,3 +465,32 @@ func TestLarge4MiBECBlockEncodeAndDirectRead(t *testing.T) {
 		t.Fatalf("4MiB block full decode failed: written=%d err=%v", written, derr)
 	}
 }
+
+func TestSpannedShardDirectReadWithUnlockedCanceledContext(t *testing.T) {
+	defer RefreshECDirectShardReadFromEnv()
+	SetECDirectShardReadEnabled(true)
+
+	// In GetObjectNInfo, inlined xl.meta objects (e.g., 128 KiB and 1 MiB on 12+4 EC)
+	// release their namespace RLock via defer before the streaming pipe goroutine finishes,
+	// which cancels lkctx.Context(). Decode must still complete cleanly just like parallelReader.
+	for _, sz := range []int{128 * 1024, 1024 * 1024} {
+		blk := int64(256 * 1024)
+		if sz >= 1024*1024 {
+			blk = 1024 * 1024
+		}
+		set := setupEncodedStripeSet(t, 12, 4, blk, sz)
+		lkCtx, unlock := context.WithCancel(context.Background())
+		unlock() // Simulate GetObjectNInfo defer lock.RUnlock(lkctx)
+
+		readers, counters := set.makeCountingReaders(0, 4096)
+		var out bytes.Buffer
+		written, derr := set.erasure.Decode(lkCtx, &out, readers, 0, 4096, int64(sz), nil)
+		closeBitrotReaders(readers)
+		if derr != nil || written != 4096 || !bytes.Equal(out.Bytes(), set.payload[:4096]) {
+			t.Fatalf("size=%d unlocked-context direct read failed: written=%d err=%v", sz, written, derr)
+		}
+		if touched, _ := countTouchedShards(counters); touched != 1 {
+			t.Fatalf("size=%d expected 1 shard touched, got %d", sz, touched)
+		}
+	}
+}
